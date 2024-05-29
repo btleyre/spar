@@ -36,10 +36,6 @@ def save_reps_and_labels(args, model, data_loader):
     representations, ys, metas = [], [], []
     with torch.no_grad():
         for i, batch in enumerate(data_loader):
-            print(i)
-            #print("Metas shape is: {}".format(batch[2].shape))
-            #print(batch[2])
-            #print(batch)
             # get the inputs
             x, y = batch[0].to(device), batch[1].to(device)
             representation = model_copy(x).detach().cpu().numpy()
@@ -110,7 +106,6 @@ def spar_chi_adaptation(X_train_representations, Z_test_representations, Y_train
     print(train_rank)
     null_vh_x = copy.deepcopy(vh_x)[train_rank:]
     vh_x = vh_x[:train_rank]
-    ood_rank = np.linalg.matrix_rank(Z_test_representations)
 
     # Get the test eigenvector variances
     eig_correlations = np.matmul(vh_x, vh_z.transpose())
@@ -162,12 +157,53 @@ def spar_chi_adaptation(X_train_representations, Z_test_representations, Y_train
     return chi2_w_proj[:, None]
 
 
+def save_eigenmetric(X_train_representations, Z_test_representations, Y_train_labels, sigma_squared, 
+                     save_metric_matrix_path):
+    """Save the matrix of evalue ratios and evector dot prods.
+
+    Parameters:
+        X_train_representations: torch tensor. The training representations.
+        Z_test_representations: torch tensor. The test representations.
+        Y_train_labels: torch tensor. The training labels.
+        sigma_squared: float. The estimated variance of the label noise.
+        save_metric_matrix_path: str. Where to save the matrix.
+
+    """
+    # Perform SVD to get the right singular vectors. These will be used
+    # to construct the subspaces that we're projecting into.
+    u_x, s_x, vh_x = np.linalg.svd(X_train_representations, full_matrices=False)
+    squared_s_x = s_x**2
+    u_z, s_z, vh_z = np.linalg.svd(Z_test_representations, full_matrices=False)
+    squared_s_z = s_z**2
+
+    train_rank = np.linalg.matrix_rank(X_train_representations)
+    u_x = u_x[:, :train_rank]
+    s_x = s_x[:train_rank]
+    squared_s_x = squared_s_x[:train_rank]
+    print("vh_x is {}".format(vh_x.shape))
+    print(train_rank)
+    null_vh_x = copy.deepcopy(vh_x)[train_rank:]
+    vh_x = vh_x[:train_rank]
+
+    # Get the test eigenvector variances
+    eig_correlations = np.matmul(vh_x, vh_z.transpose())
+    eigenratio_matrix = np.matmul((1/squared_s_x)[:, None], squared_s_z[None, :])
+    eigenmetric_matrix = (eig_correlations**2)*eigenratio_matrix
+    # save a normalized version of the eigenmetric matrix:
+    normalized_squared_s_z = (s_z/np.sqrt(Z_test_representations.shape[0]))**2
+    normalized_eigenratio_matrix = np.matmul((1/squared_s_x)[:, None], normalized_squared_s_z[None, :])
+    normalized_eigenmetric_matrix = (eig_correlations**2)*normalized_eigenratio_matrix
+    np.save(save_metric_matrix_path, normalized_eigenmetric_matrix)
+
+
+
+
 # code base: https://github.com/huaxiuyao/LISA/tree/main/domain_shifts
 
 runId = datetime.datetime.now().isoformat().replace(':', '_')
 torch.backends.cudnn.benchmark = True
 
-parser = argparse.ArgumentParser(description='Gradient Matching for Domain Generalization.')
+parser = argparse.ArgumentParser(description='Povertymap experiments for SpAR.')
 # General
 parser.add_argument('--dataset', type=str, default='poverty',
                     help="Name of dataset")
@@ -202,6 +238,9 @@ parser.add_argument("--mix_alpha", default=0.5, type=float)
 parser.add_argument("--print_loss_iters", default=100, type=int)
 parser.add_argument("--kde_bandwidth", default=0.5, type=float)
 
+# Whether we want to save the eigenmetric matrix for plotting later (figure 2)
+parser.add_argument("--save_eigenmetric_matrix", default=False, action='store_true')
+
 parser.add_argument("--is_kde", default=0, type=int) # kde mixup or random mixup
 parser.add_argument("--save_pred", default=False, action='store_true')
 parser.add_argument("--save_dir", default='result', type=str)
@@ -209,6 +248,19 @@ parser.add_argument("--fold", default='A', type=str)
 parser.add_argument('--num_workers', type=int, default=4,
                     help='Number of workers that the DataLoader will create')
 parser.add_argument("--adapt_to_unlabeled_test_data", default=False, action='store_true')
+# DARE-GRAM hyparams
+parser.add_argument('--dare_gram_tradeoff_angle', type=float, default=0.05,
+                        help='tradeoff for angle alignment')
+parser.add_argument('--dare_gram_tradeoff_scale', type=float, default=0.001,
+                        help='tradeoff for scale alignment')
+parser.add_argument('--dare_gram_treshold', type=float, default=0.9,
+                        help='treshold for the pseudo inverse')
+# RSD hyparams
+parser.add_argument('--rsd_tradeoff', type=float, default=0.001,
+                        help='tradeoff of RSD')
+parser.add_argument('--rsd_tradeoff2', type=float, default=0.01,
+                        help='tradeoff of BMP')
+
 
 
 
@@ -317,6 +369,215 @@ def train_erm(train_loader, epoch, agg):
             save_best_model(model, runPath, agg, args)
 
 
+def train_dare_gram(train_loader, epoch, agg,
+                    uda_loader=unlabeled_loaders['test_unlabeled']):
+    # NOTE: uda_loader is the "unsupervised domain adaptation" loader, which 
+    #       defaults to the unlabeled test data defined above. This will be used
+    #       to compute the DARE-GRAM loss.
+
+    def DARE_GRAM_LOSS(H1, H2):    
+        """https://github.com/ismailnejjar/DARE-GRAM/blob/main/code/dSprites/dare_gram.py"""
+        b,p = H1.shape
+
+        A = torch.cat((torch.ones(b,1).to(device), H1), 1)
+        B = torch.cat((torch.ones(b,1).to(device), H2), 1)
+
+        cov_A = (A.t()@A)
+        cov_B = (B.t()@B) 
+
+        _,L_A,_ = torch.linalg.svd(cov_A)
+        _,L_B,_ = torch.linalg.svd(cov_B)
+        
+        eigen_A = torch.cumsum(L_A.detach(), dim=0)/L_A.sum()
+        eigen_B = torch.cumsum(L_B.detach(), dim=0)/L_B.sum()
+
+        if(eigen_A[1]>args.dare_gram_treshold):
+            T = eigen_A[1].detach()
+        else:
+            T = args.dare_gram_treshold
+            
+        index_A = torch.argwhere(eigen_A.detach()<=T)[-1]
+
+        if(eigen_B[1]>args.dare_gram_treshold):
+            T = eigen_B[1].detach()
+        else:
+            T = args.dare_gram_treshold
+
+        index_B = torch.argwhere(eigen_B.detach()<=T)[-1]
+        
+        k = max(index_A, index_B)[0]
+
+        A = torch.linalg.pinv(cov_A ,rtol = (L_A[k]/L_A[0]).detach())
+        B = torch.linalg.pinv(cov_B ,rtol = (L_B[k]/L_B[0]).detach())
+        
+        cos_sim = torch.nn.CosineSimilarity(dim=0,eps=1e-6)
+        cos = torch.dist(torch.ones((p+1)).to(device),(cos_sim(A,B)),p=1)/(p+1)
+        
+        penalty1 = cos # the "angle" penalty
+        penalty2 = torch.dist((L_A[:k]),(L_B[:k]))/k # the "scale" penalty
+        return penalty1, penalty2
+
+
+    running_mse = 0
+    running_penalty1 = 0
+    running_penalty2 = 0
+    running_loss = 0
+    total_iters = len(train_loader)
+    print('\n====> Epoch: {:03d} ,arg = dare_gram'.format(epoch))
+    uda_batches = iter(uda_loader) # so I can grab the next batch
+    for i, data in enumerate(train_loader):
+        model.train()
+        # get the inputs
+        x, y = unpack_data(data, device)
+        try:
+            # get a batch of unlabeled data from target domain
+            uda_batch = next(uda_batches)
+            x_target = uda_batch[0].to(device)
+            # trim to same size as source batch
+            x_target = x_target[:len(x)]
+            assert len(x_target) == len(x), 'Target batch was small while source batch was big'
+        except StopIteration: # ran out of UDA data
+            uda_batches = iter(uda_loader)
+            uda_batch = next(uda_batches)
+            x_target = uda_batch[0].to(device)
+        except AssertionError: # this UDA batch isn't full sized; skip it
+            uda_batches = iter(uda_loader)
+            uda_batch = next(uda_batches)
+            x_target = uda_batch[0].to(device)
+        optimiserC.zero_grad()
+        # y_hat = model(x)
+        y_hat, z = model.enc(x, with_feats=True)
+        _, z_target = model.enc(x_target, with_feats=True)
+        penalty1, penalty2 = DARE_GRAM_LOSS(z, z_target)
+        running_penalty1 += penalty1.clone().item()
+        running_penalty2 += penalty2.clone().item()
+        total_dare_gram_penalty = args.dare_gram_tradeoff_angle * penalty1 \
+                            + args.dare_gram_tradeoff_scale * penalty2
+        mse = criterion(y_hat, y)
+        running_mse += mse.clone().item()
+        loss = mse + total_dare_gram_penalty
+        loss.backward()
+        #if args.use_bert_params:
+        #    torch.nn.utils.clip_grad_norm_(model.parameters(),
+        #                                   args.max_grad_norm)
+        optimiserC.step()
+
+        running_loss += loss.item()
+        # print statistics
+        if (i + 1) % args.print_loss_iters == 0 and args.print_iters != -1 :
+
+            agg['train_mse'].append(running_mse / args.print_loss_iters)
+            agg['train_penalty1'].append(running_penalty1 / args.print_loss_iters)
+            agg['train_penalty2'].append(running_penalty2 / args.print_loss_iters)
+            agg['train_loss'].append(running_loss / args.print_loss_iters)
+            agg['train_iters'].append(i + 1 + epoch * total_iters)
+            print(
+                'iteration {:05d}/{:d}: MSE: {:6.3f}, penalty1: {:6.3f}, penalty1: {:6.3f}, loss: {:6.3f}'.format(i + 1, total_iters, running_loss / args.print_loss_iters,
+                running_penalty1 / args.print_loss_iters,
+                running_penalty2 / args.print_loss_iters,
+                running_loss / args.print_loss_iters
+                ))
+            running_mse = 0.0
+            running_penalty1 = 0.0
+            running_penalty2 = 0.0
+            running_loss = 0.0
+
+        if (i + 1) % args.print_iters == 0 and args.print_iters != -1 and (
+                (i + 1) / args.print_iters >= 2 or epoch >= 1):
+            test(val_loader, agg, loader_type='val')
+            test(test_loader, agg, loader_type='test')
+            save_best_model(model, runPath, agg, args)
+
+
+def train_rsd(train_loader, epoch, agg,
+              uda_loader=unlabeled_loaders['test_unlabeled']):
+    # NOTE: uda_loader is the "unsupervised domain adaptation" loader, which 
+    #       defaults to the unlabeled test data defined above. This will be used
+    #       to compute the RSD loss.
+
+    def RSD(Feature_s, Feature_t):
+        """https://github.com/thuml/Domain-Adaptation-Regression/blob/master/DAR-RSD/dSprites/train_rsd.py"""
+        u_s, s_s, v_s = torch.svd(Feature_s.t())
+        u_t, s_t, v_t = torch.svd(Feature_t.t())
+        p_s, cospa, p_t = torch.svd(torch.mm(u_s.t(), u_t))
+        sinpa = torch.sqrt(1-torch.pow(cospa,2))
+        # return torch.norm(sinpa,1) + args.tradeoff2*torch.norm(torch.abs(p_s) - torch.abs(p_t), 2)
+        penalty1 = torch.norm(sinpa,1) 
+        penalty2 = torch.norm(torch.abs(p_s) - torch.abs(p_t), 2)
+        return penalty1, penalty2
+
+
+    running_mse = 0
+    running_penalty1 = 0
+    running_penalty2 = 0
+    running_loss = 0
+    total_iters = len(train_loader)
+    print('\n====> Epoch: {:03d} ,arg = rsd'.format(epoch))
+    uda_batches = iter(uda_loader) # so I can grab the next batch
+    for i, data in enumerate(train_loader):
+        model.train()
+        # get the inputs
+        x, y = unpack_data(data, device)
+        try:
+            # get a batch of unlabeled data from target domain
+            uda_batch = next(uda_batches)
+            x_target = uda_batch[0].to(device)
+            # trim to same size as source batch
+            x_target = x_target[:len(x)]
+            assert len(x_target) == len(x), 'Target batch was small while source batch was big'
+        except StopIteration: # ran out of UDA data
+            uda_batches = iter(uda_loader)
+            uda_batch = next(uda_batches)
+        except AssertionError: # this UDA batch isn't full sized; skip it
+            uda_batches = iter(uda_loader)
+            uda_batch = next(uda_batches)
+        optimiserC.zero_grad()
+        # y_hat = model(x)
+        y_hat, z = model.enc(x, with_feats=True)
+        _, z_target = model.enc(x_target, with_feats=True)
+        penalty1, penalty2 = RSD(z, z_target)
+        running_penalty1 += penalty1.clone().item()
+        running_penalty2 += penalty2.clone().item()
+        total_rsd_penalty = args.rsd_tradeoff * (
+            penalty1 + args.rsd_tradeoff2 * penalty2
+        )
+        mse = criterion(y_hat, y)
+        running_mse += mse.clone().item()
+        loss = mse + total_rsd_penalty
+        loss.backward()
+        #if args.use_bert_params:
+        #    torch.nn.utils.clip_grad_norm_(model.parameters(),
+        #                                   args.max_grad_norm)
+        optimiserC.step()
+
+        running_loss += loss.item()
+        # print statistics
+        if (i + 1) % args.print_loss_iters == 0 and args.print_iters != -1 :
+            agg['train_mse'].append(running_mse / args.print_loss_iters)
+            agg['train_loss'].append(running_loss / args.print_loss_iters)
+            agg['train_penalty1'].append(running_penalty1 / args.print_loss_iters)
+            agg['train_penalty2'].append(running_penalty2 / args.print_loss_iters)
+            agg['train_iters'].append(i + 1 + epoch * total_iters)
+            print(
+                'iteration {:05d}/{:d}: MSE: {:6.3f}, penalty1: {:6.3f}, penalty1: {:6.3f}, loss: {:6.3f}'.format(i + 1, total_iters, running_loss / args.print_loss_iters,
+                running_penalty1 / args.print_loss_iters,
+                running_penalty2 / args.print_loss_iters,
+                running_loss / args.print_loss_iters
+                ))
+            running_mse = 0.0
+            running_penalty1 = 0.0
+            running_penalty2 = 0.0
+            running_loss = 0.0
+
+        if (i + 1) % args.print_iters == 0 and args.print_iters != -1 and (
+                (i + 1) / args.print_iters >= 2 or epoch >= 1):
+            test(val_loader, agg, loader_type='val')
+            test(test_loader, agg, loader_type='test')
+            save_best_model(model, runPath, agg, args)
+
+
+
+
 def train_mixup(train_loader, epoch, agg):
     print('into train_mixup')
     model.train()
@@ -411,7 +672,6 @@ def linear_test(eval_loader, test_representations, test_labels, test_metas, line
             return total_se
 
         else:
-
             test_val = eval_loader.dataset.eval(ypreds.cpu(), y.cpu(), torch.from_numpy(test_metas).cpu())
 
             if save_pred_path is not None and save_target_path is not None:
@@ -474,7 +734,7 @@ if __name__ == '__main__':
         full_performance_dictionary['lr'] = args.optimiser_args['lr']
         full_performance_dictionary['bw'] = args.kde_bandwidth
         pd.DataFrame(full_performance_dictionary, index=[0]).to_csv("{}.csv".format(artifact_path, args.seed, args.algorithm))
-
+ 
     if args.projection:
         if not os.path.exists(args.proj_artifact_dir):
             os.mkdir(args.proj_artifact_dir)
@@ -532,12 +792,24 @@ if __name__ == '__main__':
             print(unlabeled_test_reps.shape)
             print(unlabeled_test_metas.shape)
 
+        # Test the original model's performance with our linear prediction scheme
+        og_model = torch.nn.Linear(512, 1, bias=False)
+        og_model = og_model.to(device)
+        new_state_dict = {'weight': torch.from_numpy(model.enc.fc.weight.detach().cpu().numpy())}
+        og_model.load_state_dict(new_state_dict)
+        og_model = og_model.to(device)
+
+        og_test_performance = linear_test(test_loader, test_reps, test_ys, test_metas, og_model, agg, is_train=False)[0]
+
+        print(original_test_performance_dict)
+        print(og_test_performance)
+
 
         # Estimate sigma^2 using the performance of the OLS soln
-        train_pinv_soln = compute_pseudoinvese_soln(train_reps, train_ys)
+        train_pinv_soln_for_sigma = compute_pseudoinvese_soln(train_reps, train_ys)
         ols_model = torch.nn.Linear(512, 1, bias=False)
         ols_model = ols_model.to(device)
-        new_state_dict = {'weight': torch.from_numpy(train_pinv_soln).transpose(1, 0)}
+        new_state_dict = {'weight': torch.from_numpy(train_pinv_soln_for_sigma).transpose(1, 0)}
         ols_model.load_state_dict(new_state_dict)
         ols_model = ols_model.to(device)
 
@@ -552,6 +824,8 @@ if __name__ == '__main__':
         ols_test_performance = linear_test(test_loader, test_reps, test_ys, test_metas, ols_model, agg, is_train=False)
         ols_id_val_performance = linear_test(tv_loaders['id_val'], id_val_reps, id_val_ys, id_val_metas, ols_model, agg, is_train=False)
         ols_id_test_performance = linear_test(tv_loaders['id_test'], id_test_reps, id_test_ys, id_test_metas, ols_model, agg, is_train=False)
+
+
 
         # Save the results as a CSV
         ols_test_perf_dict = ols_test_performance[0]
@@ -569,12 +843,51 @@ if __name__ == '__main__':
         ols_full_performance_dictionary['bw'] = args.kde_bandwidth
         pd.DataFrame(ols_full_performance_dictionary, index=[0]).to_csv("{}/ols_perf.csv".format(args.proj_artifact_dir))
 
+        if args.save_eigenmetric_matrix:
+
+            # Save ID test set eigenmetric matrix
+            save_eigenmetric(
+                train_reps, id_test_reps, train_ys,
+                sigma_squared=sigma_squared_estimate,
+                save_metric_matrix_path="{}/povertymap_{}_lr_{}_bw_{}_seed_{}_normalized_id_test_set_eigenmetric".format(
+                    args.proj_artifact_dir,
+                    args.algorithm,
+                    args.optimiser_args['lr'],
+                    args.kde_bandwidth,
+                    args.seed
+                )
+            )
+
         # now adapt the regressor we actually want to evaluate OOD
         if args.adapt_to_unlabeled_test_data:
             target_reps = unlabeled_test_reps
         else:
             target_reps = test_reps
     
+        if args.save_eigenmetric_matrix:
+            # Save OOD test set eigenmetric matrix
+            if args.adapt_to_unlabeled_test_data:
+                current_save_metric_matrix_path = "{}/povertymap_{}_lr_{}_bw_{}_seed_{}_normalized_UDA_test_set_eigenmetric".format(
+                    args.proj_artifact_dir,
+                    args.algorithm,
+                    args.optimiser_args['lr'],
+                    args.kde_bandwidth,
+                    args.seed
+                )
+            else:
+                current_save_metric_matrix_path = "{}/povertymap_{}_lr_{}_bw_{}_seed_{}_normalized_transductive_test_set_eigenmetric".format(
+                    args.proj_artifact_dir,
+                    args.algorithm,
+                    args.optimiser_args['lr'],
+                    args.kde_bandwidth,
+                    args.seed
+                )
+            save_eigenmetric(
+            train_reps, target_reps, train_ys,
+            sigma_squared=sigma_squared_estimate, 
+            save_metric_matrix_path=current_save_metric_matrix_path
+            )
+
         w_proj = spar_chi_adaptation(
             train_reps, target_reps, train_ys,
             sigma_squared=sigma_squared_estimate
@@ -590,13 +903,14 @@ if __name__ == '__main__':
         os.mkdir("{}/w_proj_predictions".format(args.proj_artifact_dir))
         os.mkdir("{}/w_proj_targets".format(args.proj_artifact_dir))
         w_proj_val_performance = linear_test(val_loader, val_reps, val_ys, val_metas, w_proj_model, agg, is_train=False,
-                save_pred_path="{}/w_proj_predictions/poverty_split:val_fold:{}_epoch:best_pred.csv".format(args.proj_artifact_dir, args.fold), save_target_path='{}/w_proj_targets/poverty_split:val_fold:{}_epoch:best_pred.csv'.format(args.proj_artifact_dir, args.fold))
+                save_pred_path="{}/w_proj_predictions/poverty_split:val_fold:{}_epoch:best_pred.csv".format(args.proj_artifact_dir, args.fold), save_target_path='{}/w_proj_targets/poverty_split:val_fold:{}_epoch:targets.csv'.format(args.proj_artifact_dir, args.fold))
         w_proj_test_performance = linear_test(test_loader, test_reps, test_ys, test_metas, w_proj_model, agg, is_train=False,
-                save_pred_path="{}/w_proj_predictions/poverty_split:test_fold:{}_epoch:best_pred.csv".format(args.proj_artifact_dir, args.fold), save_target_path='{}/w_proj_targets/poverty_split:test_fold:{}_epoch:best_pred.csv'.format(args.proj_artifact_dir, args.fold))
+                save_pred_path="{}/w_proj_predictions/poverty_split:test_fold:{}_epoch:best_pred.csv".format(args.proj_artifact_dir, args.fold), save_target_path='{}/w_proj_targets/poverty_split:test_fold:{}_epoch:targets.csv'.format(args.proj_artifact_dir, args.fold))
         w_proj_id_val_performance = linear_test(tv_loaders['id_val'], id_val_reps, id_val_ys, id_val_metas, w_proj_model, agg, is_train=False,
-                save_pred_path="{}/w_proj_predictions/poverty_split:id_val_fold:{}_epoch:best_pred.csv".format(args.proj_artifact_dir, args.fold), save_target_path='{}/w_proj_targets/poverty_split:id_val_fold:{}_epoch:best_pred.csv'.format(args.proj_artifact_dir, args.fold))
+                save_pred_path="{}/w_proj_predictions/poverty_split:id_val_fold:{}_epoch:best_pred.csv".format(args.proj_artifact_dir, args.fold), save_target_path='{}/w_proj_targets/poverty_split:id_val_fold:{}_epoch:targets.csv'.format(args.proj_artifact_dir, args.fold))
         w_proj_id_test_performance = linear_test(tv_loaders['id_test'], id_test_reps, id_test_ys, id_test_metas, w_proj_model, agg, is_train=False,
-                save_pred_path="{}/w_proj_predictions/poverty_split:id_test_fold:{}_epoch:best_pred.csv".format(args.proj_artifact_dir, args.fold), save_target_path='{}/w_proj_targets/poverty_split:id_test_fold:{}_epoch:best_pred.csv'.format(args.proj_artifact_dir, args.fold))
+                save_pred_path="{}/w_proj_predictions/poverty_split:id_test_fold:{}_epoch:best_pred.csv".format(args.proj_artifact_dir, args.fold), save_target_path='{}/w_proj_targets/poverty_split:id_test_fold:{}_epoch:targets.csv'.format(args.proj_artifact_dir, args.fold))
+
 
 
         # Save the results as a CSV
@@ -615,3 +929,5 @@ if __name__ == '__main__':
         full_performance_dictionary['bw'] = args.kde_bandwidth
         pd.DataFrame(full_performance_dictionary, index=[0]).to_csv("{}/w_proj_perf.csv".format(args.proj_artifact_dir))
 
+
+    print('done')

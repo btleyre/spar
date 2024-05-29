@@ -212,7 +212,6 @@ class Model(nn.Module):
         unlabeled_loaders = {}
         for split, dataset in datasets_unlabeled.items():
             print(f'len(datasets_unlabeled[{split}]) = {len(dataset)}')
-            # unlabeled_loaders[split] = get_eval_loader('standard', dataset, batch_size=64, shuffle=True) #256)
             unlabeled_loaders[split] = get_train_loader('standard', dataset, batch_size=64) #256)
             # NOTE: since we plan to adapt (not eval) on these data, we ask for the train (shuffled) version of the data loader
 
